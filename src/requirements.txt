@@ -1,0 +1,9 @@
+pydantic
+requests
+pdfplumber
+httpx
+beautifulsoup4
+pytest
+pandas
+scikit-learn
+joblib

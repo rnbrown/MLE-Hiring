@@ -32,7 +32,13 @@ def get_portfolio_stats() -> dict:
             SUM(transaction_count) AS total_transactions,
             AVG(monthly_volume) AS avg_volume,
             MIN(monthly_volume) AS min_volume,
-            MAX(monthly_volume) AS max_volume
+            MAX(monthly_volume) AS max_volume,
+            SUM(
+                CASE WHEN transaction_count > 0
+                     THEN CAST(dispute_count AS REAL) / transaction_count * monthly_volume
+                     ELSE 0
+                END
+            ) AS expected_loss
         FROM merchants
     """).fetchone()
 
@@ -44,11 +50,18 @@ def get_portfolio_stats() -> dict:
     stats["min_volume"] = row[5]
     stats["max_volume"] = row[6]
     stats["overall_dispute_rate"] = round(row[2] / row[3] * 100, 4) if row[3] else 0
+    stats["expected_loss"] = round(row[7], 2) if row[7] else 0
 
     # By country
     country_rows = conn.execute("""
         SELECT country, COUNT(*) AS n, SUM(monthly_volume) AS vol,
-               SUM(dispute_count) AS disputes, SUM(transaction_count) AS txns
+               SUM(dispute_count) AS disputes, SUM(transaction_count) AS txns,
+               SUM(
+                   CASE WHEN transaction_count > 0
+                        THEN CAST(dispute_count AS REAL) / transaction_count * monthly_volume
+                        ELSE 0
+                   END
+               ) AS expected_loss
         FROM merchants
         GROUP BY country
         ORDER BY vol DESC
@@ -56,7 +69,8 @@ def get_portfolio_stats() -> dict:
     stats["by_country"] = [
         {"country": r[0], "merchants": r[1], "volume": r[2],
          "disputes": r[3], "transactions": r[4],
-         "dispute_rate": round(r[3] / r[4] * 100, 4) if r[4] else 0}
+         "dispute_rate": round(r[3] / r[4] * 100, 4) if r[4] else 0,
+         "expected_loss": round(r[5], 2) if r[5] else 0}
         for r in country_rows
     ]
 
@@ -70,14 +84,16 @@ def get_portfolio_stats() -> dict:
             END AS risk_level,
             COUNT(*) AS n,
             SUM(monthly_volume) AS vol,
-            SUM(dispute_count) AS disputes
+            SUM(dispute_count) AS disputes,
+            SUM(CAST(dispute_count AS REAL) / transaction_count * monthly_volume) AS expected_loss
         FROM merchants
         WHERE transaction_count > 0
         GROUP BY risk_level
         ORDER BY risk_level
     """).fetchall()
     stats["by_risk_level"] = [
-        {"risk_level": r[0], "merchants": r[1], "volume": r[2], "disputes": r[3]}
+        {"risk_level": r[0], "merchants": r[1], "volume": r[2], "disputes": r[3],
+         "expected_loss": round(r[4], 2) if r[4] else 0}
         for r in risk_rows
     ]
 
@@ -88,11 +104,13 @@ def get_portfolio_stats() -> dict:
 def build_prompt(stats: dict) -> str:
     country_lines = "\n".join(
         f"  - {c['country']}: {c['merchants']} merchants, volume ${c['volume']:,}, "
-        f"disputes {c['disputes']}, dispute rate {c['dispute_rate']}%"
+        f"disputes {c['disputes']}, dispute rate {c['dispute_rate']}%, "
+        f"expected loss ${c['expected_loss']:,.2f}"
         for c in stats["by_country"]
     )
     risk_lines = "\n".join(
-        f"  - {r['risk_level']}: {r['merchants']} merchants, volume ${r['volume']:,}, disputes {r['disputes']}"
+        f"  - {r['risk_level']}: {r['merchants']} merchants, volume ${r['volume']:,}, "
+        f"disputes {r['disputes']}, expected loss ${r['expected_loss']:,.2f}"
         for r in stats["by_risk_level"]
     )
 
@@ -101,11 +119,15 @@ def build_prompt(stats: dict) -> str:
     return f"""You are a senior underwriting analyst. Write a professional portfolio underwriting
 report in markdown format based on the following portfolio statistics. The report date is {today}.
 
+Expected loss is computed per merchant as dispute_rate * monthly_volume, then summed. It represents
+the volume-weighted dispute exposure: merchants with higher volume and higher dispute rates contribute
+more to portfolio expected loss.
+
 The report should include:
-1. An executive summary
-2. Portfolio overview (size, volume, dispute rates)
-3. Geographic breakdown
-4. Risk distribution analysis
+1. An executive summary (include total expected loss)
+2. Portfolio overview (size, volume, dispute rates, expected loss)
+3. Geographic breakdown (with expected loss per country)
+4. Risk distribution analysis (with expected loss per risk tier)
 5. Key observations and recommendations
 
 Portfolio Statistics:
@@ -114,6 +136,7 @@ Portfolio Statistics:
 - Total transactions: {stats['total_transactions']:,}
 - Total disputes: {stats['total_disputes']}
 - Overall dispute rate: {stats['overall_dispute_rate']}%
+- Portfolio expected loss: ${stats['expected_loss']:,.2f}
 - Average merchant volume: ${stats['avg_volume']:,}
 - Volume range: ${stats['min_volume']:,} - ${stats['max_volume']:,}
 

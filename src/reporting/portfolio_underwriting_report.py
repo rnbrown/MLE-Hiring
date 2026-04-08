@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import sqlite3
 from datetime import date
 from pathlib import Path
@@ -117,11 +118,13 @@ def build_prompt(stats: dict) -> str:
     today = date.today().isoformat()
 
     return f"""You are a senior underwriting analyst. Write a professional portfolio underwriting
-report in markdown format based on the following portfolio statistics. The report date is {today}.
+report in markdown format based on the following portfolio statistics.
 
-Expected loss is computed per merchant as dispute_rate * monthly_volume, then summed. It represents
-the volume-weighted dispute exposure: merchants with higher volume and higher dispute rates contribute
-more to portfolio expected loss.
+MANDATORY formatting rules — you must follow these exactly:
+- The report header must start with: **Date:** {today}
+- Do NOT include any "Prepared For" or "Prepared By" lines.
+- ALL currency values MUST use US dollar signs ($). NEVER use pound signs (£).
+- Expected loss is computed per merchant as dispute_rate * monthly_volume, then summed.
 
 The report should include:
 1. An executive summary (include total expected loss)
@@ -146,7 +149,16 @@ By Country:
 By Risk Level:
 {risk_lines}
 
-Write the report now. Use markdown formatting with headers, tables where appropriate, and clear professional language."""
+Write the report now. Use markdown formatting with headers, tables where appropriate, and clear professional language.
+Remember: $ for all currencies, date is {today}, no "Prepared For" / "Prepared By"."""
+
+
+SYSTEM_INSTRUCTION = (
+    "You are a senior underwriting analyst writing reports for a US-based BNPL company. "
+    "STRICT RULES: 1) All currency values use US dollars ($), NEVER pounds (£). "
+    "2) The report header is ONLY '**Date:** <date>' — no Prepared For, Prepared By, To, From, or Subject lines. "
+    "3) Use the exact date provided in the prompt."
+)
 
 
 def call_gemini(prompt: str) -> str:
@@ -154,6 +166,7 @@ def call_gemini(prompt: str) -> str:
         GEMINI_URL,
         params={"key": GEMINI_API_KEY},
         json={
+            "system_instruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
             "contents": [{"parts": [{"text": prompt}]}],
         },
         timeout=60,
@@ -161,6 +174,34 @@ def call_gemini(prompt: str) -> str:
     resp.raise_for_status()
     data = resp.json()
     return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def post_process(report: str, report_date: str) -> str:
+    """Fix formatting the LLM may get wrong: currency symbols, date, attribution lines."""
+    # Replace pound signs with dollar signs
+    report = report.replace("£", "$")
+
+    # Remove Prepared For / Prepared By / To / From / Subject lines
+    lines = report.splitlines()
+    filtered: list[str] = []
+    for line in lines:
+        stripped = line.strip().lower()
+        if any(stripped.startswith(prefix) for prefix in (
+            "**prepared for", "**prepared by", "**to:", "**from:", "**subject:",
+            "prepared for", "prepared by", "to:", "from:", "subject:",
+        )):
+            continue
+        filtered.append(line)
+    report = "\n".join(filtered)
+
+    # Fix the date to match the actual report date
+    report = re.sub(
+        r"(\*\*Date:\*\*)\s*\S.*",
+        rf"\1 {report_date}",
+        report,
+    )
+
+    return report
 
 
 def main() -> None:
@@ -184,6 +225,7 @@ def main() -> None:
     log.info("Generating report with Gemini...")
     prompt = build_prompt(stats)
     report = call_gemini(prompt)
+    report = post_process(report, date.today().isoformat())
 
     REPORT_PATH.write_text(report)
     log.info("Report written to: %s", REPORT_PATH)
